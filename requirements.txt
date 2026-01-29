@@ -3,3 +3,4 @@ google-cloud-firestore>=2.0.0
 google-genai
 uvicorn
 fastapi
+python-telegram-bot>=20.0
