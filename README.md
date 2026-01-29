@@ -55,14 +55,6 @@ gcloud run deploy adk-agent-service \
     --allow-unauthenticated
 ```
 
-**Cost Optimization:**
-- `--memory 512Mi` - Minimum memory allocation (cheapest)
-- `--cpu 1` - Single CPU (cheapest)
-- `--cpu-throttling` - CPU only allocated during requests (cheaper)
-- `--min-instances 0` - Scales to zero when idle (no idle cost)
-- `--max-instances 5` - Limits maximum scale (cost cap)
-- `--timeout 60` - Shorter timeout to avoid long-running costs
-
 ### Configuration
 
 | Variable | Value | Purpose |
@@ -71,21 +63,6 @@ gcloud run deploy adk-agent-service \
 | `GOOGLE_CLOUD_LOCATION` | `asia-southeast1` | Region for Vertex AI |
 | `GOOGLE_GENAI_USE_VERTEXAI` | `True` | Use Vertex AI for Gemini access |
 | `PORT` | `8080` | Server port (set by Cloud Run) |
-
-### Resources (Cheapest Configuration)
-
-- **Memory:** 512 MiB (minimum)
-- **CPU:** 1 vCPU (minimum)
-- **CPU Throttling:** Enabled (CPU only active during requests)
-- **Timeout:** 60 seconds
-- **Min Instances:** 0 (scales down to zero when idle - no idle cost)
-- **Max Instances:** 5 (cost cap during high traffic)
-- **Region:** Asia Southeast 1 (Singapore)
-
-**Monthly Cost Estimate (Low Traffic):**
-- ~$0.00 when idle (scales to zero)
-- ~$0.05-$0.50 per month for light usage (few requests per day)
-- Only charged for actual request processing time + Firestore operations
 
 ## Session Storage
 

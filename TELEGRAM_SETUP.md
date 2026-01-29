@@ -193,6 +193,27 @@ Visit `https://adk-agent-service-975087229168.asia-southeast1.run.app/dev-ui`
 
 ## Troubleshooting
 
+### Bot Returns 503 Error or "Telegram bot not configured"
+
+**Symptoms:** Webhook returns 503, bot status shows "disabled"
+
+**Root Cause:** The Telegram bot handler uses lazy initialization - it initializes on the first webhook call or status check, not during app startup.
+
+**Solution:**
+1. The bot should auto-initialize on first use
+2. Check initialization by calling: `curl https://your-service-url/telegram/webhook-status`
+3. If still failing, check logs for initialization errors:
+   ```bash
+   gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=adk-agent-service-2" \
+       --project=loop-470211 \
+       --limit=50 | grep -i "telegram"
+   ```
+
+**Common issues:**
+- Missing `TELEGRAM_BOT_TOKEN` environment variable
+- Invalid bot token format
+- ADK agent import errors
+
 ### Webhook Not Receiving Messages
 
 1. Check webhook status:
@@ -205,18 +226,30 @@ curl https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getWebhookInfo
 curl https://adk-agent-service-xxxxx.run.app/telegram/webhook-status
 ```
 
-3. Check Cloud Run logs:
+3. Check Cloud Run logs for webhook processing:
 ```bash
-gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=adk-agent-service" \
+gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=adk-agent-service-2" \
     --project=loop-470211 \
     --limit=50
 ```
 
-### "Telegram bot not configured"
+### Bot Only Echoes Messages (Not Using AI)
 
-- Ensure `TELEGRAM_BOT_TOKEN` environment variable is set
-- Redeploy after setting the token
-- Restart the application: `gcloud run services update-traffic adk-agent-service --to-revisions LATEST`
+**Symptoms:** Bot responds with "Received your message: ..." instead of AI responses
+
+**Root Cause:** Bot handler not connected to ADK agent or session service
+
+**Solution:** Ensure [main.py](main.py:54-78) passes `root_agent` and `telegram_session_service` to TelegramBotHandler:
+
+```python
+telegram_handler = TelegramBotHandler(
+    bot_token=TELEGRAM_BOT_TOKEN,
+    agent=root_agent,  # Must be passed
+    session_service=telegram_session_service,  # Must be passed
+)
+```
+
+Check logs for "Telegram bot initialized with ADK agent successfully"
 
 ### Webhook Updates Getting Stuck
 
@@ -245,21 +278,25 @@ curl -X POST https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook \
 
 ### Session Management
 
-- Each Telegram user gets a unique session identified by their Telegram user ID
-- Conversation history is stored in Firestore under:
+- Each Telegram user gets a unique session: `session_id = f"telegram_{user_id}"`
+- Conversation history stored in Firestore under:
   ```
   adk_sessions/my_agent/users/{telegram_user_id}/sessions/telegram_{user_id}
   ```
 - Sessions persist across messages and bot restarts
+- Uses same `FirestoreSessionService` as web UI
+- `/new` command creates new session with timestamp suffix
 
-### Message Handling
+### Message Handling Flow
 
-The `TelegramBotHandler` class:
-- Receives messages via webhook (webhook handler)
-- Routes messages through the ADK agent
-- Manages Telegram-specific commands (`/start`, `/help`, `/new`)
-- Handles typing indicators and long messages (Telegram 4096 char limit)
-- Logs all interactions for debugging
+1. **Webhook receives Telegram update** → `POST /webhook/telegram`
+2. **Lazy initialization** → Bot handler initializes on first call if not already initialized
+3. **Message processing** → `TelegramBotHandler.handle_message()`
+4. **Agent query** → `_get_agent_response()` calls ADK Runner
+5. **Session lookup** → Get or create session from Firestore
+6. **AI processing** → Message sent to Gemini 2.5 Flash via ADK agent
+7. **Response collection** → Stream response events, extract text parts
+8. **Reply sent** → Response sent back to Telegram (split if >4096 chars)
 
 ### Architecture
 
@@ -268,16 +305,27 @@ Telegram User
     ↓
 Telegram Bot API (webhook)
     ↓
-POST /webhook/telegram (main.py)
+POST /webhook/telegram (main.py:81-95)
     ↓
-TelegramBotHandler.handle_webhook()
+TelegramBotHandler.handle_webhook() (telegram_handler.py:206)
     ↓
-ADK Agent (my_agent/agent.py)
+TelegramBotHandler.handle_message() (telegram_handler.py:118)
     ↓
-Firestore Session Storage
+_get_agent_response() (telegram_handler.py:146)
     ↓
-Response back to Telegram
+ADK Runner.run_async() with root_agent (Gemini 2.5 Flash)
+    ↓
+Firestore Session Storage (project2 database)
+    ↓
+Response streamed back → Telegram reply_text()
 ```
+
+### Key Implementation Files
+
+- **[main.py](main.py)** - FastAPI app, webhook endpoint, lazy initialization
+- **[telegram_handler.py](telegram_handler.py)** - Bot logic, message routing to ADK agent
+- **[my_agent/agent.py](my_agent/agent.py)** - Gemini 2.5 Flash agent definition
+- **[firestore_session_service.py](firestore_session_service.py)** - Session persistence
 
 ## Configuration
 

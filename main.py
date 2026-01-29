@@ -3,14 +3,25 @@ import os
 import logging
 
 from fastapi import Request, HTTPException
-from telegram import Update
 
 # Register custom Firestore session service
 from google.adk.cli.service_registry import get_service_registry
 from firestore_session_service import FirestoreSessionService
 from telegram_handler import TelegramBotHandler
+from my_agent.agent import root_agent
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Initialize Telegram bot handler at module level
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+telegram_handler = None
+telegram_session_service = None
+
+if TELEGRAM_BOT_TOKEN:
+    logger.info(f"TELEGRAM_BOT_TOKEN found, length: {len(TELEGRAM_BOT_TOKEN)}")
+else:
+    logger.warning("TELEGRAM_BOT_TOKEN not set - Telegram integration disabled")
 
 
 def firestore_session_factory(uri: str, **kwargs) -> FirestoreSessionService:
@@ -41,33 +52,32 @@ app = get_fast_api_app(
     web=True,  # Enable ADK dev UI
 )
 
-# Initialize Telegram bot handler
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-telegram_handler = None
 
+async def init_telegram():
+    """Initialize Telegram bot."""
+    global telegram_handler, telegram_session_service
+    if TELEGRAM_BOT_TOKEN and telegram_handler is None:
+        try:
+            logger.info("Initializing Telegram bot with ADK agent...")
 
-@app.on_event("startup")
-async def startup_telegram():
-    """Initialize Telegram bot on startup."""
-    global telegram_handler
-    if TELEGRAM_BOT_TOKEN:
-        telegram_handler = TelegramBotHandler(
-            bot_token=TELEGRAM_BOT_TOKEN,
-            agent_session_service=None,  # Will be integrated with agent
-        )
-        await telegram_handler.initialize()
-        logger.info("Telegram bot initialized")
-    else:
-        logger.warning("TELEGRAM_BOT_TOKEN not set - Telegram integration disabled")
+            # Create session service for Telegram
+            telegram_session_service = FirestoreSessionService(
+                project=os.environ.get("GOOGLE_CLOUD_PROJECT"),
+                database="project2",
+                collection_prefix="adk",
+            )
 
-
-@app.on_event("shutdown")
-async def shutdown_telegram():
-    """Shutdown Telegram bot on shutdown."""
-    global telegram_handler
-    if telegram_handler:
-        await telegram_handler.shutdown()
-        logger.info("Telegram bot shutdown")
+            telegram_handler = TelegramBotHandler(
+                bot_token=TELEGRAM_BOT_TOKEN,
+                agent=root_agent,
+                session_service=telegram_session_service,
+            )
+            await telegram_handler.initialize()
+            logger.info("Telegram bot initialized with ADK agent successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize Telegram bot: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
 
 @app.post("/webhook/telegram")
@@ -76,6 +86,12 @@ async def telegram_webhook(request: Request):
 
     Endpoint: POST /webhook/telegram
     """
+    global telegram_handler
+
+    # Lazy initialization on first webhook call
+    if telegram_handler is None and TELEGRAM_BOT_TOKEN:
+        await init_telegram()
+
     if not telegram_handler:
         raise HTTPException(
             status_code=503, detail="Telegram bot not configured"
@@ -93,8 +109,19 @@ async def telegram_webhook(request: Request):
 @app.get("/telegram/webhook-status")
 async def telegram_webhook_status():
     """Get Telegram webhook status."""
+    global telegram_handler
+
+    # Lazy initialization on status check
+    if telegram_handler is None and TELEGRAM_BOT_TOKEN:
+        await init_telegram()
+
     if not telegram_handler or not telegram_handler.app:
-        return {"status": "disabled", "message": "Telegram bot not configured"}
+        return {
+            "status": "disabled",
+            "message": "Telegram bot not configured",
+            "token_present": bool(TELEGRAM_BOT_TOKEN),
+            "token_length": len(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else 0,
+        }
 
     try:
         bot_info = await telegram_handler.app.bot.get_me()
