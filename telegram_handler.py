@@ -1,5 +1,7 @@
 """Telegram bot webhook handler for ADK agent integration."""
 import logging
+import tempfile
+import os
 
 from telegram import Update
 from telegram.ext import (
@@ -12,6 +14,7 @@ from telegram.ext import (
 
 from google.adk.runners import Runner
 from google.genai import types
+from google import genai
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +56,10 @@ class TelegramBotHandler:
         self.app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message)
         )
+        # Add audio/voice message handler
+        self.app.add_handler(
+            MessageHandler(filters.VOICE | filters.AUDIO, self.handle_audio_message)
+        )
 
         await self.app.initialize()
 
@@ -80,6 +87,11 @@ class TelegramBotHandler:
 /start - Start the conversation
 /help - Show this help message
 /new - Start a new conversation session
+
+You can interact with me by:
+- Sending text messages
+- Sending voice messages (I'll transcribe and respond)
+- Sending audio files (I'll transcribe and respond)
 
 Just send any message and I'll respond with AI!"""
         await update.message.reply_text(help_text)
@@ -133,6 +145,132 @@ Just send any message and I'll respond with AI!"""
             await update.message.reply_text(
                 "Sorry, I encountered an error. Please try again."
             )
+
+    async def handle_audio_message(
+        self, update: Update, _context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Handle incoming voice/audio messages from Telegram users."""
+        user_id = str(update.effective_user.id)
+
+        try:
+            # Show typing indicator
+            await update.message.chat.send_action("typing")
+
+            # Get the audio file (voice message or audio file)
+            if update.message.voice:
+                audio_file = update.message.voice
+                file_type = "voice"
+            else:
+                audio_file = update.message.audio
+                file_type = "audio"
+
+            logger.info(
+                f"Processing {file_type} message from {user_id}, "
+                f"file_id: {audio_file.file_id}, duration: {audio_file.duration}s"
+            )
+
+            # Download the audio file
+            file = await self.app.bot.get_file(audio_file.file_id)
+
+            # Download to a temporary file
+            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_file:
+                tmp_path = tmp_file.name
+                await file.download_to_drive(tmp_path)
+
+            try:
+                # Transcribe audio using Gemini
+                transcribed_text = await self._transcribe_audio(tmp_path)
+
+                if not transcribed_text:
+                    await update.message.reply_text(
+                        "I couldn't understand the audio. Please try again or send a text message."
+                    )
+                    return
+
+                logger.info(f"Transcribed audio: {transcribed_text[:100]}...")
+
+                # Notify user what was transcribed
+                await update.message.reply_text(f"🎤 I heard: \"{transcribed_text}\"")
+
+                # Show typing indicator again for agent response
+                await update.message.chat.send_action("typing")
+
+                # Get response from ADK agent
+                if self.runner and self.session_service:
+                    response_text = await self._get_agent_response(user_id, transcribed_text)
+                else:
+                    response_text = f"Agent not configured. Your message: {transcribed_text}"
+
+                # Split long messages (Telegram limit is 4096 chars)
+                if len(response_text) > 4096:
+                    for chunk in [response_text[i : i + 4096] for i in range(0, len(response_text), 4096)]:
+                        await update.message.reply_text(chunk)
+                else:
+                    await update.message.reply_text(response_text)
+
+            finally:
+                # Clean up temp file
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+        except Exception as e:
+            logger.error(f"Error processing audio message: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            await update.message.reply_text(
+                "Sorry, I couldn't process your audio message. Please try again or send a text message."
+            )
+
+    async def _transcribe_audio(self, audio_path: str) -> str:
+        """Transcribe audio file using Gemini.
+
+        Args:
+            audio_path: Path to the audio file
+
+        Returns:
+            Transcribed text
+        """
+        try:
+            # Initialize Gemini client for Vertex AI
+            client = genai.Client(vertexai=True)
+
+            # Read the audio file as bytes (Vertex AI doesn't support files.upload)
+            with open(audio_path, "rb") as f:
+                audio_data = f.read()
+
+            # Use Gemini to transcribe with inline audio data
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part.from_bytes(
+                                data=audio_data,
+                                mime_type="audio/ogg",
+                            ),
+                            types.Part.from_text(
+                                text="Please transcribe this audio message accurately. "
+                                "Return only the transcription, nothing else. "
+                                "If the audio is unclear or empty, return an empty string."
+                            ),
+                        ],
+                    )
+                ],
+            )
+
+            # Extract text from response
+            if response.candidates and response.candidates[0].content.parts:
+                transcribed_text = response.candidates[0].content.parts[0].text.strip()
+                return transcribed_text
+
+            return ""
+
+        except Exception as e:
+            logger.error(f"Error transcribing audio: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return ""
 
     async def _get_agent_response(self, user_id: str, message: str) -> str:
         """Get response from ADK agent.

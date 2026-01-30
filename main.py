@@ -3,6 +3,9 @@ import os
 import logging
 
 from fastapi import Request, HTTPException
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Register custom Firestore session service
 from google.adk.cli.service_registry import get_service_registry
@@ -52,6 +55,17 @@ app = get_fast_api_app(
     web=True,  # Enable ADK dev UI
 )
 
+# Rate limiting configuration
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded):
+    """Handle rate limit exceeded errors."""
+    logger.warning(f"Rate limit exceeded for {request.client.host}")
+    return HTTPException(status_code=429, detail="Rate limit exceeded. Please try again later.")
+
 
 async def init_telegram():
     """Initialize Telegram bot."""
@@ -81,6 +95,7 @@ async def init_telegram():
 
 
 @app.post("/webhook/telegram")
+@limiter.limit("30/minute")
 async def telegram_webhook(request: Request):
     """Webhook endpoint for Telegram bot updates.
 

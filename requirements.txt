@@ -4,3 +4,5 @@ google-genai
 uvicorn
 fastapi
 python-telegram-bot>=20.0
+firebase-admin>=6.0.0
+slowapi>=0.1.9
