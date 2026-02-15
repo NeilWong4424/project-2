@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gcloud run deploy:*)",
+      "Bash(gcloud run services describe:*)",
+      "Bash(curl:*)",
+      "Bash(gcloud logging read:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(pip install:*)",
+      "Bash(python -m ruff check:*)",
+      "Bash(del \"c:\\\\Users\\\\leckz\\\\.gemini\\\\antigravity\\\\scratch\\\\project-4\\\\mybola_agent\\\\tools\\\\club_stats.py\")"
+    ]
+  }
+}

@@ -3,23 +3,41 @@ import os
 import logging
 
 from fastapi import Request, HTTPException
+from fastapi.responses import JSONResponse, Response
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 # Register custom Firestore session service
 from google.adk.cli.service_registry import get_service_registry
-from firestore_session_service import FirestoreSessionService
-from telegram_handler import TelegramBotHandler
-from my_agent.agent import root_agent
+from app.services.firestore_session_service import FirestoreSessionService
+from app.telegram_handler import TelegramBotHandler
+from mybola_agent.agent import root_agent
+from app.logging_config import setup_logging
 
-logging.basicConfig(level=logging.INFO)
+setup_logging()
 logger = logging.getLogger(__name__)
 
 # Initialize Telegram bot handler at module level
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+APP_ENV = os.environ.get("APP_ENV", "production").lower()
 telegram_handler = None
 telegram_session_service = None
+
+# Validate required environment variables early.
+_required_env = [
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+]
+if TELEGRAM_BOT_TOKEN:
+    _required_env.append("TELEGRAM_BOT_TOKEN")
+
+_missing_env = [key for key in _required_env if not os.environ.get(key)]
+if _missing_env:
+    logger.error(f"Missing required environment variables: {_missing_env}")
+    if APP_ENV == "production":
+        raise RuntimeError("Missing required environment variables")
 
 if TELEGRAM_BOT_TOKEN:
     logger.info(f"TELEGRAM_BOT_TOKEN found, length: {len(TELEGRAM_BOT_TOKEN)}")
@@ -35,7 +53,7 @@ def firestore_session_factory(uri: str, **kwargs) -> FirestoreSessionService:
     """
     return FirestoreSessionService(
         project=os.environ.get("GOOGLE_CLOUD_PROJECT"),
-        database="project2",
+        database="(default)",
         collection_prefix="adk",
     )
 
@@ -43,17 +61,20 @@ def firestore_session_factory(uri: str, **kwargs) -> FirestoreSessionService:
 # Register the custom Firestore session service
 get_service_registry().register_session_service("firestore", firestore_session_factory)
 
-from google.adk.cli.fast_api import get_fast_api_app
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-# Get the directory where main.py is located (project root)
-AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup logic
+    await init_telegram()
+    yield
+    # Shutdown logic
+    if telegram_handler:
+        await telegram_handler.shutdown()
 
-# Get the FastAPI app from ADK with Firestore session service
-app = get_fast_api_app(
-    agents_dir=AGENT_DIR,
-    session_service_uri="firestore:///",  # Uses custom FirestoreSessionService
-    web=True,  # Enable ADK dev UI
-)
+app = FastAPI(lifespan=lifespan)
 
 # Rate limiting configuration
 limiter = Limiter(key_func=get_remote_address)
@@ -62,9 +83,19 @@ app.state.limiter = limiter
 
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded):
-    """Handle rate limit exceeded errors."""
+    """Handle rate limit exceeded errors.
+
+    Returns JSONResponse instead of raising exception.
+    """
     logger.warning(f"Rate limit exceeded for {request.client.host}")
-    return HTTPException(status_code=429, detail="Rate limit exceeded. Please try again later.")
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": "Rate limit exceeded",
+            "detail": "Too many requests. Please try again later.",
+            "retry_after": "60 seconds"
+        }
+    )
 
 
 async def init_telegram():
@@ -77,7 +108,7 @@ async def init_telegram():
             # Create session service for Telegram
             telegram_session_service = FirestoreSessionService(
                 project=os.environ.get("GOOGLE_CLOUD_PROJECT"),
-                database="project2",
+                database="(default)",
                 collection_prefix="adk",
             )
 
@@ -148,6 +179,18 @@ async def telegram_webhook_status():
     except Exception as e:
         logger.error(f"Error getting bot info: {e}")
         return {"status": "error", "message": str(e)}
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint."""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/healthz")
+async def healthz():
+    """Basic health check for Cloud Run."""
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":
